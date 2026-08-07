@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import sys
 from concurrent import futures
 from dataclasses import dataclass
 from typing import Optional
@@ -165,6 +166,20 @@ def serve(port: int = 8902, max_workers: int = 10) -> GrpcServerHandles:
 
     signal_servicer = SignalServiceServicer()
     signal_pb2_grpc.add_SignalServiceServicer_to_server(signal_servicer, server)
+
+    # 2026-08-07: 挂载 XA 肯泰罗选股策略 (AStockPursue 期望模块含 SignalEngine 类)
+    try:
+        _src_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if _src_dir not in sys.path:
+            sys.path.insert(0, _src_dir)
+        import xa_signal_engine as _xa_engine
+        # 环境变量参数注入到模块级 (SignalEngine.__init__ 默认值)
+        os.environ.setdefault("ASTOCKPURSUE_TOP_N", "10")
+        os.environ.setdefault("ASTOCKPURSUE_MIN_SCORE", "40")
+        signal_servicer.set_strategy(_xa_engine)
+        logger.info("XA 肯泰罗 SignalEngine 模块已挂载")
+    except Exception as _e:
+        logger.warning("XA 肯泰罗引擎挂载失败, 回退等权: %s", _e)
 
     data_servicer = DataServiceServicer()
     data_pb2_grpc.add_DataServiceServicer_to_server(data_servicer, server)

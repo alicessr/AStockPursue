@@ -35,6 +35,12 @@ services:
       BIYINGAPI_KEY: "${BIYING_API_KEY:-}"
       JIN10_MCP_TOKEN: "${JIN10_MCP_TOKEN:-}"
       XA_PROJECT_ROOT: "${XA_PROJECT_ROOT:-D:/XA Qlib Claw}"
+      # LLM (2026-08-07): AStockPursue 专用 DeepSeek — key 见 XA config/secrets/astockpursue.json
+      DEEPSEEK_API_KEY: "${DEEPSEEK_API_KEY:-}"
+      DEEPSEEK_BASE_URL: "https://api.deepseek.com/v1"
+      LANGCHAIN_PROVIDER: "deepseek"
+      LANGCHAIN_MODEL_NAME: "deepseek-v4-flash"
+      LANGCHAIN_TEMPERATURE: "0.0"
     depends_on:
       go-core:
         condition: service_started
