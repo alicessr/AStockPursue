@@ -56,9 +56,10 @@ services:
       context: frontend
       dockerfile: Dockerfile
     ports:
-      - "5899:5899"
+      - "5899:3000"
     environment:
       NEXT_PUBLIC_API_URL: "http://localhost:8899"
+      PORT: "3000"
     depends_on:
       - go-core
     networks:
