@@ -76,14 +76,16 @@ func (g *GrpcDataLoader) FetchBars(symbol string, start, end time.Time) ([]*comm
 const grpcDataServiceAddr = "localhost:8902"
 
 func init() {
-	// Priority 2: mootdx — free TCP, fastest A-share source
+	// Priority 1: tdxdb — local DuckDB (tdx.db qfq full-market), Tier-1 historical source
+	RegisterPriority(NewGrpcDataLoader("tdxdb", grpcDataServiceAddr), 1)
+	// Priority 2: mootdx — free TCP, fastest A-share realtime source
 	RegisterPriority(NewGrpcDataLoader("mootdx", grpcDataServiceAddr), 2)
-	// Priority 3: tushare — needs API key, excellent coverage
-	RegisterPriority(NewGrpcDataLoader("tushare", grpcDataServiceAddr), 3)
+	// Priority 3: biying — commercial API, gap/backfill + fundamentals depth (replaces tushare)
+	RegisterPriority(NewGrpcDataLoader("biying", grpcDataServiceAddr), 3)
 	// Priority 4: futu — needs FutuOpenD, HK + A-share
 	RegisterPriority(NewGrpcDataLoader("futu", grpcDataServiceAddr), 4)
-	// Priority 11: akshare — slow but multi-market, last resort
-	RegisterPriority(NewGrpcDataLoader("akshare", grpcDataServiceAddr), 11)
+	// Priority 99: akshare — slow but multi-market, last resort fallback
+	RegisterPriority(NewGrpcDataLoader("akshare", grpcDataServiceAddr), 99)
 }
 
 func (g *GrpcDataLoader) Close() error {

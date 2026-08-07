@@ -2,6 +2,10 @@ FROM python:3.11-slim
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+# mootdx conflicts with langchain's httpx>=0.28 (mootdx pins <0.26); core K-line is
+# pytdx TCP so --no-deps is safe (only adjust/factor/holiday utils touch httpx).
+RUN pip install --no-cache-dir mootdx==0.11.7 pytdx==1.72 tdxpy==0.2.7 --no-deps
 COPY . .
 EXPOSE 8900 8902
-CMD ["python", "mcp_server.py"]
+# Run gRPC research server (8902) in background, MCP over SSE on 8900 in foreground
+CMD ["sh", "-c", "python -m src.grpc.server & python mcp_server.py --transport sse --port 8900 --host 0.0.0.0"]

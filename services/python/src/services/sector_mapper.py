@@ -429,40 +429,49 @@ def _get_tushare_token() -> str | None:
 
 
 def _load_sw_sectors() -> dict[str, str]:
-    """Load stock→sector mapping from tushare, falling back to static data.
+    """Load stock→sector mapping from Biying (必盈) sector_tree, falling back to static data.
 
-    tushare ``stock_basic`` returns ``industry`` (CSRC/证监会 classification)
-    for every listed A-share stock.  This is the most authoritative source.
+    Biying sector_tree returns Shenwan (申万) industry tree entries named like
+    "A股-申万行业-医药生物"; sector_stocks(code) returns all constituent codes.
+    This replaces the former tushare stock_basic dependency (tushare token no
+    longer needed anywhere in the project).
     """
     mapping: dict[str, str] = {}
 
-    token = _get_tushare_token()
-    if token:
-        try:
-            import tushare as ts
-            api = ts.pro_api(token)
-            df = api.stock_basic(
-                exchange="", list_status="L",
-                fields="ts_code,industry"
-            )
-            if df is not None and not df.empty:
-                for _, row in df.iterrows():
-                    code = str(row.get("ts_code", ""))
-                    industry = str(row.get("industry", ""))
-                    if code and industry and industry != "nan" and industry:
-                        # tushare returns ts_code like "000001.SZ"
-                        norm = _normalise_code(code)
-                        # Map CSRC → SW for compatibility with Brinson sectors
-                        sw_sector = _CSRC_TO_SW.get(industry, industry)
+    try:
+        from src.services.biyingapi_bridge import get_client
+        client = get_client()
+        # 1) sector_tree — list Shenwan industry sectors (e.g. "A股-申万行业-煤炭")
+        tree = client.sector_tree()
+        sw_entries = []
+        for t in tree or []:
+            name = str(t.get("name", ""))
+            if "申万" in name:
+                short = name.replace("A股-申万行业-", "").replace("A股-申万二级-", "").replace("A股-申万三级-", "")
+                if short:
+                    sw_entries.append((short, t.get("code", "")))
+        logger.info("Biying sector_tree: %d Shenwan sectors", len(sw_entries))
+
+        # 2) sector_stocks — constituents per sector → {code: sector}
+        for sector, code in sw_entries:
+            try:
+                stocks = client.sector_stocks(code)
+                for s in stocks or []:
+                    dm = str(s.get("dm", ""))
+                    if dm.isdigit() and len(dm) == 6:
+                        norm = _normalise_code(dm)
                         if norm not in mapping:
-                            mapping[norm] = sw_sector
-                logger.info(
-                    "tushare stock_basic loaded %d stock→sector entries (%d unique sectors)",
-                    len(mapping),
-                    len(set(mapping.values())),
-                )
-        except Exception as e:
-            logger.warning("tushare stock_basic failed: %s, falling back to static", e)
+                            mapping[norm] = sector
+            except Exception as exc:
+                logger.warning("Biying sector_stocks %s failed: %s", code, exc)
+                continue
+        logger.info(
+            "Biying sector_tree loaded %d stock→sector entries (%d unique sectors)",
+            len(mapping),
+            len(set(mapping.values())),
+        )
+    except Exception as e:
+        logger.warning("Biying sector_tree failed: %s, falling back to static", e)
 
     # Merge static mapping as fallback/supplement
     static_count = 0
@@ -471,7 +480,7 @@ def _load_sw_sectors() -> dict[str, str]:
             mapping[code] = sector
             static_count += 1
     if static_count > 0:
-        logger.info("Static mapping added %d entries (tushare had %d)", static_count, len(mapping) - static_count)
+        logger.info("Static mapping added %d entries (biying had %d)", static_count, len(mapping) - static_count)
 
     logger.info("Sector mapper loaded %d stock→sector entries", len(mapping))
     return mapping

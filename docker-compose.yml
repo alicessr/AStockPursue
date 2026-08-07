@@ -9,6 +9,8 @@ services:
       PORT: "8899"
       DATABASE_URL: "postgres://postgres:postgres@postgres:5432/astockpursue?sslmode=disable"
       REDIS_URL: "redis://redis:6379/0"
+      ENCRYPTION_KEY: "${ENCRYPTION_KEY:-}"
+      JWT_SECRET: "${JWT_SECRET:-}"
     depends_on:
       postgres:
         condition: service_healthy
@@ -28,6 +30,11 @@ services:
       PYTHONUNBUFFERED: "1"
       DATABASE_URL: "postgres://postgres:postgres@postgres:5432/astockpursue?sslmode=disable"
       REDIS_URL: "redis://redis:6379/0"
+      TDX_DB_PATH: "/data/tdx/tdx.db"
+      BIYING_API_KEY: "${BIYING_API_KEY:-}"
+      BIYINGAPI_KEY: "${BIYING_API_KEY:-}"
+      JIN10_MCP_TOKEN: "${JIN10_MCP_TOKEN:-}"
+      XA_PROJECT_ROOT: "${XA_PROJECT_ROOT:-D:/XA Qlib Claw}"
     depends_on:
       go-core:
         condition: service_started
@@ -40,6 +47,7 @@ services:
     volumes:
       - ./runs:/app/runs
       - ./services/python/src:/app/src
+      - /d/tdx2db/parquet:/data/tdx:ro
 
   # Frontend runs separately for dev. To include it, use:
   #   docker compose --profile frontend up -d

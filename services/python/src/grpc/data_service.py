@@ -1,5 +1,6 @@
 """DataService gRPC implementation — bridges Python-only data loaders to Go."""
 
+import json
 import logging
 from datetime import datetime
 
@@ -50,6 +51,10 @@ class DataServiceServicer(data_pb2_grpc.DataServiceServicer):
 
     def _fetch(self, source: str, symbol: str, start: datetime, end: datetime, freq: str) -> pd.DataFrame:
         """Dispatch to the appropriate Python loader."""
+        if source == "tdxdb":
+            return self._fetch_tdxdb(symbol, start, end, freq)
+        if source == "biying":
+            return self._fetch_biying(symbol, start, end, freq)
         if source == "mootdx":
             return self._fetch_mootdx(symbol, start, end, freq)
         if source == "tushare":
@@ -59,6 +64,133 @@ class DataServiceServicer(data_pb2_grpc.DataServiceServicer):
         if source == "futu":
             return self._fetch_futu(symbol, start, end, freq)
         raise ValueError(f"unknown data source: {source}")
+
+    def _normalise_a_code(self, symbol: str) -> str:
+        """Normalise A-share symbol to bare 6-digit code (600519 / 000001)."""
+        code = symbol.strip().upper()
+        for suffix in (".SH", ".SZ", ".BJ", ".SS", ".HK"):
+            if code.endswith(suffix):
+                code = code[:-3]
+        for prefix in ("SH", "SZ", "BJ"):
+            if code.startswith(prefix) and len(code) > 2:
+                code = code[2:]
+        return code
+
+    def _fetch_tdxdb(self, symbol: str, start: datetime, end: datetime, freq: str) -> pd.DataFrame:
+        """Fetch A-share bars from local tdx.db (DuckDB, qfq daily full market).
+
+        tdx.db is the XA Qlib Claw data backbone: D:/tdx2db/parquet/tdx.db,
+        views v_stock_qfq / v_etf_qfq, symbols like sh600519 / sz000001 / bj8xxxxx.
+        Intraday gap (request end >= today) is backfilled from mootdx so the
+        local DB stays the Tier-1 source without blocking live bars.
+        """
+        import os
+        import duckdb
+
+        code = self._normalise_a_code(symbol)
+        if not (code.isdigit() and len(code) == 6):
+            return pd.DataFrame()
+
+        db_path = os.environ.get("TDX_DB_PATH", "/data/tdx/tdx.db")
+        if not os.path.exists(db_path):
+            # Local dev fallback (host path when running outside Docker)
+            alt = "D:/tdx2db/parquet/tdx.db"
+            if os.path.exists(alt):
+                db_path = alt
+            else:
+                logger.warning("tdx.db not found at %s or %s", db_path, alt)
+                return pd.DataFrame()
+
+        if freq != "1d":
+            return pd.DataFrame()  # tdx.db only has daily; sub-daily falls through
+
+        # sh/sz/bj prefix mapping: 6xx/68x -> sh, 0xx/3xx -> sz, 4x/8x/9x -> bj
+        if code.startswith(("60", "68")):
+            tdx_symbol = "sh" + code
+        elif code.startswith(("00", "30")):
+            tdx_symbol = "sz" + code
+        else:
+            tdx_symbol = "bj" + code
+
+        sd = start.strftime("%Y-%m-%d")
+        ed = end.strftime("%Y-%m-%d")
+        sql = (
+            f"SELECT date, open, high, low, close, volume, amount FROM v_stock_qfq "
+            f"WHERE symbol = ? AND date >= ? AND date <= ? "
+            f"UNION ALL "
+            f"SELECT date, open, high, low, close, volume, amount FROM v_etf_qfq "
+            f"WHERE symbol = ? AND date >= ? AND date <= ? "
+            f"ORDER BY date"
+        )
+        try:
+            with duckdb.connect(db_path, read_only=True) as conn:
+                df = conn.execute(sql, [tdx_symbol, sd, ed, tdx_symbol, sd, ed]).fetchdf()
+        except Exception as exc:
+            logger.warning("tdxdb fetch failed for %s: %s", tdx_symbol, exc)
+            return pd.DataFrame()
+
+        if df is None or df.empty:
+            return pd.DataFrame()
+
+        df["trade_date"] = pd.to_datetime(df["date"])
+        df = df.set_index("trade_date")
+        # tdx.db volume is in shares (股); convert to lots (手) to match mootdx/akshare
+        df["volume"] = pd.to_numeric(df["volume"], errors="coerce") / 100.0
+        for col in ["open", "high", "low", "close"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        # Intraday gap: if the request reaches today but tdx.db is only updated
+        # after close (19:00 cron), backfill today's live bar from mootdx.
+        today = pd.Timestamp.now().normalize()
+        if end >= today and df.index.max() < today:
+            gap_start = df.index.max() + pd.Timedelta(days=1)
+            gap_end = min(end, today)
+            try:
+                live = self._fetch_mootdx(symbol, gap_start.to_pydatetime(), gap_end.to_pydatetime(), freq)
+                if live is not None and not live.empty:
+                    df = pd.concat([df, live])
+                    df = df[~df.index.duplicated(keep="last")].sort_index()
+            except Exception as exc:
+                logger.warning("tdxdb intraday backfill via mootdx failed: %s", exc)
+
+        return df[["open", "high", "low", "close", "volume"]]
+
+    def _fetch_biying(self, symbol: str, start: datetime, end: datetime, freq: str) -> pd.DataFrame:
+        """Fetch A-share bars via Biying (必盈) API — gold tier, qfq.
+
+        Reuses the ported XA biyingapi_bridge (rate limiter, quota tracking,
+        disk cache, field names all inherited). Endpoint:
+            GET https://api.biyingapi.com/hsstock/history/{code}.{SH|SZ}/d/f/{KEY}
+        st/et are YYYYMMDD (per official docs); lt=N for latest N bars.
+        """
+        if freq != "1d":
+            return pd.DataFrame()
+
+        code = self._normalise_a_code(symbol)
+        if not (code.isdigit() and len(code) == 6):
+            return pd.DataFrame()
+
+        from src.services.biyingapi_bridge import get_client
+        client = get_client()
+        rows = client.kline(
+            code,
+            tf="d",
+            adj="f",
+            st=start.strftime("%Y%m%d"),
+            et=end.strftime("%Y%m%d"),
+        )
+        if not rows:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(rows)
+        df["trade_date"] = pd.to_datetime(df["t"])
+        df = df.set_index("trade_date")
+        df = df.rename(columns={"o": "open", "h": "high", "l": "low", "c": "close", "v": "volume"})
+        for col in ["open", "high", "low", "close", "volume"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        # biying volume is in lots (手) — already matches loader convention
+        return df[["open", "high", "low", "close", "volume"]].dropna(subset=["open", "high", "low", "close"])
 
     def _fetch_mootdx(self, symbol: str, start: datetime, end: datetime, freq: str) -> pd.DataFrame:
         """Fetch A-share bars via mootdx (通达信 TCP protocol)."""

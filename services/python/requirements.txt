@@ -44,6 +44,8 @@ requests>=2.31.0
 yfinance>=0.2.30
 akshare>=1.12.0
 ccxt>=4.0.0
+# NOTE: mootdx 0.11.7 requires httpx<0.26 which conflicts with langchain's httpx>=0.28.
+# Installed separately in Dockerfile with --no-deps (core K-line uses pytdx TCP, not httpx).
 
 # gRPC
 grpcio>=1.60.0
