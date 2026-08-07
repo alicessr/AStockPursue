@@ -31,6 +31,10 @@ _HAVE_XA = bool(_XA_SRC)
 if _HAVE_XA:
     from claw.research.kentaurus import compute_kentaurus, kentaurus_entry_filter, kentaurus_market_score
     try:
+        # 缠论库: XA vendored chan.py (/app/chan 目录即包根, 含 ClawAPI 适配)
+        _chan_dir = os.environ.get("ASTOCKPURSUE_CHAN_DIR", "/app/chan")
+        if _chan_dir and _chan_dir not in sys.path:
+            sys.path.insert(0, _chan_dir)
         from claw.research.chan_bridge import run_chan_analysis
         _CHAN_OK = True
     except Exception as _ce:
@@ -83,9 +87,12 @@ class SignalEngine:
         self._chan_cache = {}
 
     def _chan_ok(self, code: str) -> bool:
-        """缠论闸门: 中枢数据可得才算有效候选 (duckdb 源). 库不可用/异常放行(保守)."""
+        """缠论中枢 — 观测项, 不硬过滤 (对齐 watcher: '中枢数据可用不计分').
+
+        有中枢则权重加成, 无中枢不拦截 (缠论确认买卖点不是每个日线都有, 用户确认正常态).
+        """
         if not _CHAN_OK:
-            return True  # 缠论库不可用 → 不误杀
+            return True
         if code in self._chan_cache:
             return self._chan_cache[code]
         ok = True
@@ -123,10 +130,10 @@ class SignalEngine:
                     score = 60
                 if score < self.min_score:
                     continue
-                if not self._chan_ok(code):
-                    continue
-                # 权重 = 仓位系数 × 分数归一
-                w = round(float(factor) * (score / 100.0), 4)
+                # 缠论中枢: 观测加分 (有中枢 ×1.2), 不硬拦截
+                chan_bonus = 1.2 if self._chan_ok(code) else 1.0
+                # 权重 = 仓位系数 × 分数归一 × 中枢加成
+                w = round(float(factor) * (score / 100.0) * chan_bonus, 4)
                 results.append((code, w, score, reason))
             except Exception as e:
                 print(f"  [gate] {code} 失败: {str(e)[:60]}")
