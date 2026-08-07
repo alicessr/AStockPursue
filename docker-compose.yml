@@ -41,6 +41,8 @@ services:
       LANGCHAIN_PROVIDER: "deepseek"
       LANGCHAIN_MODEL_NAME: "deepseek-v4-flash"
       LANGCHAIN_TEMPERATURE: "0.0"
+      # 2026-08-07: XA 源码路径 (SignalEngine 用真 XA 引擎)
+      ASTOCKPURSUE_XA_SRC: "/app/xa_src"
     depends_on:
       go-core:
         condition: service_started
@@ -54,6 +56,8 @@ services:
       - ./runs:/app/runs
       - ./services/python/src:/app/src
       - /d/tdx2db/parquet:/data/tdx:ro
+      # 2026-08-07: XA 源码挂载 — SignalEngine 用真 XA 引擎 (肯泰罗+缠论+闸门)
+      - "D:/XA Qlib Claw/src:/app/xa_src:ro"
 
   # Frontend runs separately for dev. To include it, use:
   #   docker compose --profile frontend up -d

@@ -1,12 +1,16 @@
 # -*- coding: utf-8 -*-
-"""XA 肯泰罗 SignalEngine — AStockPursue 选股策略挂载 (2026-08-07).
+"""XA 肯泰罗+缠论+闸门 SignalEngine — AStockPursue 选股策略挂载 (2026-08-07 v2).
 
-架构: XA 的肯泰罗 Plus 引擎 (技术面选股) 封装为 AStockPursue SignalEngine,
-serve 启动时 set_strategy() 挂载 → GenerateSignals 返回真实选股权重而非等权.
+架构: XA 选股逻辑 (肯泰罗入场过滤 + 缠论中枢 + 三层闸门) 封装为 AStockPursue
+SignalEngine, serve 启动时 set_strategy() 挂载 → GenerateSignals 返回真选股权重.
 
-流程:
-  GenerateSignals(bars) → data_map{code: DataFrame} → 每只跑肯泰罗评分
-  → 信号 = 肯泰罗分数归一化 (0~100 → 0~1) → weights (取最后bar)
+三层闸门 (对应 watcher precheck 的入场判定):
+  1. 肯泰罗入场过滤 — kentaurus_entry_filter: 红背景+事件触发, 否则拒
+  2. 缠论中枢 — run_chan_analysis(source=duckdb): 有中枢数据才算有效候选
+  3. 权重归一 — 通过前两层的按分数排序取 TopN
+
+数据源: XA tdx2db (tdx.db, 容器挂载 /data/tdx/tdx.db).
+XA 源码路径: ASTOCKPURSUE_XA_SRC (容器 compose 已挂 D:/XA Qlib Claw/src).
 """
 from __future__ import annotations
 
@@ -17,89 +21,127 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-# ── 挂载 XA 肯泰罗引擎 (容器外 XA 源码可经 ASTOCKPURSUE_XA_SRC 指定) ──
+# ── XA 源码挂载 (由 compose 环境变量注入) ──
 _XA_SRC = os.environ.get("ASTOCKPURSUE_XA_SRC", "")
 if _XA_SRC and _XA_SRC not in sys.path:
     sys.path.insert(0, _XA_SRC)
 
-if os.environ.get("ASTOCKPURSUE_XA_SRC"):
-    from claw.research.kentaurus import compute_kentaurus, kentaurus_market_score
+_HAVE_XA = bool(_XA_SRC)
+
+if _HAVE_XA:
+    from claw.research.kentaurus import compute_kentaurus, kentaurus_entry_filter, kentaurus_market_score
+    try:
+        from claw.research.chan_bridge import run_chan_analysis
+        _CHAN_OK = True
+    except Exception as _ce:
+        print(f"  [chan] 缠论库不可用, 降级跳过: {str(_ce)[:50]}")
+        _CHAN_OK = False
 else:
-    # 容器内未挂 XA: 用同目录的轻量实现 (见下方 _compute_kentaurus_local)
+    # 无 XA 源码时回退轻量实现 (仅保证服务可用, 非生产)
     def compute_kentaurus(df, symbol="", name=""):
-        return _compute_kentaurus_local(df, symbol, name)
+        return _compute_local(df, symbol)
 
-    def kentaurus_market_score(k_result):
-        accepted = k_result.get("accepted", False)
-        return {"accepted": accepted, "score": k_result.get("score", 0),
-                "signals": k_result.get("signals", []), "reason": k_result.get("reason", "")}
+    def kentaurus_entry_filter(k_result):
+        return (k_result.get("accepted", False), 0.5, "local_fallback")
+
+    def run_chan_analysis(*a, **k):
+        return {"zhongshu": None, "available": False}
+    _CHAN_OK = False
 
 
-def _compute_kentaurus_local(df: pd.DataFrame, symbol: str = "", name: str = "") -> dict:
-    """轻量肯泰罗 — 容器内无 XA 时的回退实现 (MA 趋势 + 动量 + 量能).
-
-    注意: 这是简化版; 完整版需挂载 XA 源码 (ASTOCKPURSUE_XA_SRC 指向 D:/XA Qlib Claw/src).
-    """
+def _compute_local(df: pd.DataFrame, symbol: str = "") -> dict:
+    """轻量回退: MA 趋势 + 动量 + 量能 (无 XA 源码时仅保底)."""
     if df is None or len(df) < 20:
-        return {"accepted": False, "score": 0, "signals": [], "reason": "data_insufficient",
-                "background": "none", "kline_type": "normal"}
+        return {"accepted": False, "score": 0, "signals": {}, "reason": "data_insufficient",
+                "background": "green", "kline_type": "normal"}
     c = df["close"]
     ma5, ma20 = c.rolling(5).mean(), c.rolling(20).mean()
     vol = df["volume"].rolling(5).mean()
     score = 0
-    signals = []
-    # 趋势: 价 > MA20 且 MA5 > MA20
+    signals = {}
     if c.iloc[-1] > ma20.iloc[-1] and ma5.iloc[-1] > ma20.iloc[-1]:
         score += 40
-        signals.append("trend_up")
-    # 动量: 5日涨幅
+        signals["trend_up"] = True
     mom5 = (c.iloc[-1] / c.iloc[-5] - 1) if len(c) > 5 else 0
     if mom5 > 0.03:
         score += 30
-        signals.append("momentum")
-    # 量能: 放量
+        signals["momentum"] = True
     if len(vol) > 5 and vol.iloc[-1] > vol.iloc[-6:-1].mean() * 1.2:
         score += 20
-        signals.append("volume_expand")
+        signals["volume_expand"] = True
     return {"accepted": score >= 40, "score": min(100, score), "signals": signals,
-            "reason": "local_fallback", "background": "red" if score >= 40 else "none",
-            "kline_type": "normal"}
+            "background": "red" if score >= 40 else "green", "kline_type": "normal",
+            "kdj_j": 50.0, "volume_ratio": 1.0}
 
 
 class SignalEngine:
-    """XA 肯泰罗信号引擎 — 对每只票跑肯泰罗, 信号 = 分数归一化。"""
+    """XA 三层闸门信号引擎 — 肯泰罗过滤 + 缠论中枢 + 权重排序。"""
 
     def __init__(self, top_n: int = None, min_score: int = None):
         self.top_n = top_n or int(os.environ.get("ASTOCKPURSUE_TOP_N", "10"))
         self.min_score = min_score or int(os.environ.get("ASTOCKPURSUE_MIN_SCORE", "40"))
+        self._chan_cache = {}
+
+    def _chan_ok(self, code: str) -> bool:
+        """缠论闸门: 中枢数据可得才算有效候选 (duckdb 源). 库不可用/异常放行(保守)."""
+        if not _CHAN_OK:
+            return True  # 缠论库不可用 → 不误杀
+        if code in self._chan_cache:
+            return self._chan_cache[code]
+        ok = True
+        try:
+            sym = f"sh{code}" if code.startswith(("6", "9")) else f"sz{code}"
+            r = run_chan_analysis(sym, source="duckdb", timeframes=["D1"], use_cache=True)
+            ok = bool(r and r.get("zhongshu"))
+        except Exception:
+            ok = True  # 数据缺失不误杀
+        self._chan_cache[code] = ok
+        return ok
 
     def generate(self, data_map: dict) -> dict:
-        """data_map: {symbol: DataFrame(open/high/low/close/volume)} → {symbol: Series}。"""
-        scores = {}
+        """data_map: {symbol: DataFrame} → {symbol: Series}。
+
+        三层闸门:
+          1. compute_kentaurus 计算 → kentaurus_entry_filter 判定允许建仓
+          2. 缠论中枢 (D1) 数据可得
+          3. 分数排序取 TopN, 权重 = position_factor * score/100
+        """
+        results = []
         for code, df in data_map.items():
             try:
+                if df is None or len(df) < 40:
+                    continue  # 数据不足跳过 (防 indexer out-of-bounds)
                 k = compute_kentaurus(df, symbol=code)
-                verdict = kentaurus_market_score(k) if "accepted" not in k else k
-                score = int(verdict.get("score", 0))
-                accepted = bool(verdict.get("accepted", False))
-                if accepted and score >= self.min_score:
-                    scores[code] = score
+                allow, factor, reason = kentaurus_entry_filter(k)
+                if not allow:
+                    continue
+                # 分数: kentaurus_market_score 严格评分 (无则用 60 保底)
+                try:
+                    ms = kentaurus_market_score(k)
+                    score = int(ms.get("score", 60))
+                except Exception:
+                    score = 60
+                if score < self.min_score:
+                    continue
+                if not self._chan_ok(code):
+                    continue
+                # 权重 = 仓位系数 × 分数归一
+                w = round(float(factor) * (score / 100.0), 4)
+                results.append((code, w, score, reason))
             except Exception as e:
-                print(f"  [kentaurus] {code} 失败: {str(e)[:50]}")
+                print(f"  [gate] {code} 失败: {str(e)[:60]}")
                 continue
 
-        if not scores:
+        if not results:
             return {}
-        # 分数 → 0~1 权重 (保持区分度: score/100), 取 TopN
-        ranked = sorted(scores.items(), key=lambda kv: -kv[1])[: self.top_n]
+        ranked = sorted(results, key=lambda r: -r[1])[: self.top_n]
         signals = {}
-        for code, s in ranked:
-            signals[code] = pd.Series([float(s) / 100.0])
+        for code, w, score, reason in ranked:
+            signals[code] = pd.Series([w])
         return signals
 
 
 if __name__ == "__main__":
-    # 自测
     n = 60
     idx = pd.date_range("2026-06-01", periods=n, freq="D")
     fake = pd.DataFrame({
@@ -109,4 +151,4 @@ if __name__ == "__main__":
     }, index=idx)
     eng = SignalEngine()
     out = eng.generate({"TEST": fake})
-    print("自测输出:", {k: float(v.iloc[-1]) for k, v in out.items()})
+    print("自测:", {k: float(v.iloc[-1]) for k, v in out.items()})
